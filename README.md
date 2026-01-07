@@ -257,6 +257,31 @@ When reporting issues, please include:
 - Your LiteLLM configuration (with secrets redacted)
 - Steps to reproduce the issue
 
+## Extras
+
+This repository includes captured artifacts from Cursor's request format, useful for understanding how Cursor communicates with LLM backends or for building similar integrations.
+
+| File | Description |
+|------|-------------|
+| [`extras/cursor-system-prompt.md`](extras/cursor-system-prompt.md) | The full system prompt Cursor sends to Claude, including instructions for tool calling, code formatting, browser tools, frontend aesthetics, and more |
+| [`extras/cursor-toolkit.json`](extras/cursor-toolkit.json) | Complete JSON schema of all tools Cursor provides to the model, including file operations, terminal commands, browser automation, and MCP integrations |
+
+### Cursor Tool Categories
+
+The toolkit includes 32 tools across these categories:
+
+| Category | Tools |
+|----------|-------|
+| **File Operations** | `read_file`, `write`, `search_replace`, `delete_file`, `list_dir`, `glob_file_search` |
+| **Code Intelligence** | `grep`, `read_lints`, `edit_notebook` |
+| **Terminal** | `run_terminal_cmd` |
+| **Web Search** | `web_search` |
+| **Task Management** | `todo_write` |
+| **MCP Resources** | `list_mcp_resources`, `fetch_mcp_resource` |
+| **Browser Automation** | `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_screenshot`, and 13 more |
+
+These files are provided for educational and research purposes.
+
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.

@@ -1,8 +1,12 @@
 # Credentials - NEVER commit these!
-*.json
-!package.json
 credentials/
 .gcs-credentials.json
+*credentials*.json
+*service-account*.json
+
+# Allow specific JSON files
+!extras/*.json
+!package.json
 
 # Python
 __pycache__/
