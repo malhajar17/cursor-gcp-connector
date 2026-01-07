@@ -1,38 +1,194 @@
 #!/usr/bin/env python3
 """
-Cursor-GCP Connector Proxy
+Cursor GCP Connector - Compatibility Proxy
 
-A proxy that transforms Cursor IDE requests to be compatible with Claude on Vertex AI
-via LiteLLM. It handles incompatibilities between Cursor's OpenAI-compatible requests
-and Vertex AI's Claude API.
+This proxy sits between Cursor IDE and LiteLLM, fixing compatibility issues
+between Cursor's OpenAI-style requests and Vertex AI's Claude API.
 
-Key transformations:
-- Removes unsupported beta features (cache_control, thinking, etc.)
-- Filters orphaned tool_result messages
-- Removes problematic headers
+Key fixes:
+1. Removes `cache_control` from messages (Vertex AI beta feature not supported)
+2. Removes orphaned `tool_result` blocks (Cursor sends conversation history)
+3. Removes `tool_choice` parameter (format incompatible with Vertex AI)
+4. Filters `Anthropic-Beta` headers
+5. Removes thinking/reasoning parameters that trigger beta features
+
+Usage:
+    python proxy.py [--port PORT] [--litellm-url URL] [--log-file PATH]
+
+Environment Variables:
+    PROXY_PORT          - Port to listen on (default: 4001)
+    LITELLM_URL         - LiteLLM backend URL (default: http://localhost:4000)
+    PROXY_LOG_FILE      - Log file path (default: /tmp/cursor-proxy.log)
+    PROXY_DEBUG         - Enable debug logging (default: false)
 """
 
 import json
 import logging
 import os
+import sys
+import argparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import urllib.request
 import urllib.error
+from datetime import datetime
 
-# Configure logging
-LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
+# =============================================================================
 # Configuration
-LITELLM_URL = os.environ.get('LITELLM_URL', 'http://localhost:4000')
-PROXY_PORT = int(os.environ.get('PROXY_PORT', '4001'))
+# =============================================================================
+
+DEFAULT_PORT = 4001
+DEFAULT_LITELLM_URL = "http://localhost:4000"
+DEFAULT_LOG_FILE = "/tmp/cursor-proxy.log"
+
+# Parameters to remove from requests (incompatible with Vertex AI)
+BLOCKED_PARAMS = [
+    "tool_choice",
+    "thinking", 
+    "reasoning_effort",
+    "extended_thinking",
+    "budget_tokens",
+    "metadata",
+    "stream_options",
+]
+
+# Headers to filter out
+BLOCKED_HEADERS = [
+    "host",
+    "content-length", 
+    "anthropic-beta",
+]
+
+# =============================================================================
+# Logging Setup
+# =============================================================================
+
+def setup_logging(log_file: str, debug: bool = False) -> logging.Logger:
+    """Configure logging with file and console handlers."""
+    logger = logging.getLogger("cursor-proxy")
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    
+    # File handler
+    file_handler = logging.FileHandler(log_file, mode='a')
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s'
+    ))
+    logger.addHandler(file_handler)
+    
+    # Console handler (for systemd/docker logs)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s'
+    ))
+    logger.addHandler(console_handler)
+    
+    return logger
+
+# =============================================================================
+# Request Processing
+# =============================================================================
+
+def remove_cache_control(obj):
+    """Recursively remove cache_control from any nested structure."""
+    if isinstance(obj, dict):
+        # Remove cache_control key if present
+        obj.pop("cache_control", None)
+        # Recurse into values
+        for value in obj.values():
+            remove_cache_control(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            remove_cache_control(item)
+    return obj
+
+
+def clean_messages(messages: list, logger: logging.Logger) -> list:
+    """
+    Clean messages to be compatible with Vertex AI Claude.
+    
+    Main issue: Cursor sends conversation history with `tool_result` blocks
+    embedded in user messages, but Vertex AI requires tool_result to immediately
+    follow the assistant's tool_use message. Solution: remove tool_result blocks.
+    """
+    cleaned = []
+    
+    for msg in messages:
+        if not isinstance(msg, dict):
+            cleaned.append(msg)
+            continue
+            
+        content = msg.get("content")
+        
+        if isinstance(content, list):
+            # Filter out tool_result blocks from content array
+            new_content = []
+            for item in content:
+                if isinstance(item, dict):
+                    item_type = item.get("type", "")
+                    
+                    # Skip tool_result blocks entirely
+                    if item_type == "tool_result":
+                        logger.debug(f"Removing tool_result block: {item.get('tool_use_id', 'unknown')}")
+                        continue
+                    
+                    # Remove cache_control from item
+                    remove_cache_control(item)
+                    new_content.append(item)
+                else:
+                    new_content.append(item)
+            
+            # Only add message if it has content left
+            if new_content:
+                msg["content"] = new_content
+                cleaned.append(msg)
+            else:
+                logger.debug(f"Dropping empty message after cleaning")
+        else:
+            # Simple string content - keep as is
+            cleaned.append(msg)
+    
+    return cleaned
+
+
+def process_request_body(data: dict, logger: logging.Logger) -> dict:
+    """
+    Process and clean the request body for Vertex AI compatibility.
+    
+    Returns the modified request data.
+    """
+    # Remove blocked parameters
+    for param in BLOCKED_PARAMS:
+        if param in data:
+            logger.info(f"Removing parameter: {param}")
+            del data[param]
+    
+    # Remove cache_control from system messages
+    if "system" in data:
+        remove_cache_control(data["system"])
+    
+    # Clean messages
+    if "messages" in data:
+        original_count = len(data["messages"])
+        data["messages"] = clean_messages(data["messages"], logger)
+        new_count = len(data["messages"])
+        if original_count != new_count:
+            logger.info(f"Cleaned messages: {original_count} -> {new_count}")
+    
+    return data
+
+# =============================================================================
+# HTTP Handler
+# =============================================================================
 
 class ProxyHandler(BaseHTTPRequestHandler):
+    """HTTP request handler that proxies to LiteLLM with fixes."""
+    
+    # Class-level config (set before server starts)
+    litellm_url = DEFAULT_LITELLM_URL
+    logger = None
+    debug = False
+    
     def do_POST(self):
+        """Handle POST requests (chat completions)."""
         try:
             # Read request body
             content_length = int(self.headers.get('Content-Length', 0))
@@ -41,57 +197,30 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # Parse JSON
             data = json.loads(body) if body else {}
             
-            logger.debug(f"Incoming request to {self.path}")
+            if self.debug:
+                self.logger.debug(f"Incoming request: {json.dumps(data, indent=2)[:2000]}")
             
-            # Remove tool_choice (not supported properly by Vertex AI)
-            if "tool_choice" in data:
-                logger.info(f"Removing tool_choice: {data['tool_choice']}")
-                del data["tool_choice"]
-            
-            # Remove beta features not supported by Vertex AI
-            if "system" in data:
-                self._remove_cache_control(data["system"], "system")
-            
-            # Remove metadata (beta feature)
-            if "metadata" in data:
-                logger.info("Removing metadata")
-                del data["metadata"]
-            
-            # Remove stream_options
-            if "stream_options" in data:
-                logger.info("Removing stream_options")
-                del data["stream_options"]
-            
-            # Remove parameters that trigger beta headers
-            beta_params = ["thinking", "reasoning_effort", "extended_thinking", "budget_tokens"]
-            for param in beta_params:
-                if param in data:
-                    logger.info(f"Removing beta param: {param}")
-                    del data[param]
-            
-            # Fix messages
-            if "messages" in data:
-                data["messages"] = self._fix_messages(data["messages"])
+            # Process and clean the request
+            data = process_request_body(data, self.logger)
             
             # Forward to LiteLLM
             modified_body = json.dumps(data).encode('utf-8')
             
             req = urllib.request.Request(
-                f"{LITELLM_URL}{self.path}",
+                f"{self.litellm_url}{self.path}",
                 data=modified_body,
                 method='POST'
             )
             
-            # Copy headers but filter problematic ones
-            blocked_headers = ['host', 'content-length', 'anthropic-beta', 'x-anthropic-beta']
+            # Copy headers, filtering blocked ones
             for key, value in self.headers.items():
-                if key.lower() not in blocked_headers:
+                if key.lower() not in BLOCKED_HEADERS:
                     req.add_header(key, value)
             req.add_header('Content-Type', 'application/json')
             
             # Make request to LiteLLM
             try:
-                with urllib.request.urlopen(req, timeout=120) as response:
+                with urllib.request.urlopen(req, timeout=300) as response:
                     response_body = response.read()
                     
                     self.send_response(response.status)
@@ -104,7 +233,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     
             except urllib.error.HTTPError as e:
                 error_body = e.read()
-                logger.error(f"LiteLLM error: {error_body.decode()}")
+                self.logger.error(f"LiteLLM error ({e.code}): {error_body[:500]}")
                 self.send_response(e.code)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', len(error_body))
@@ -112,7 +241,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self.wfile.write(error_body)
                 
         except Exception as e:
-            logger.exception(f"Proxy error: {e}")
+            self.logger.exception(f"Proxy error: {e}")
             error_response = json.dumps({"error": str(e)}).encode()
             self.send_response(500)
             self.send_header('Content-Type', 'application/json')
@@ -120,76 +249,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(error_response)
     
-    def _remove_cache_control(self, obj, location):
-        """Recursively remove cache_control from objects"""
-        if isinstance(obj, list):
-            for item in obj:
-                self._remove_cache_control(item, location)
-        elif isinstance(obj, dict):
-            if "cache_control" in obj:
-                logger.info(f"Removing cache_control from {location}")
-                del obj["cache_control"]
-    
-    def _fix_messages(self, messages):
-        """Fix message format for Vertex AI compatibility.
-        
-        Key transformations:
-        1. Remove ALL tool_result blocks from user messages (they're conversation history)
-        2. Remove cache_control from all content
-        3. Convert tool_use in assistant messages to tool_calls format
-        """
-        fixed_messages = []
-        
-        for i, msg in enumerate(messages):
-            role = msg.get("role", "")
-            content = msg.get("content")
-            
-            if isinstance(content, list):
-                new_content = []
-                
-                for item in content:
-                    if isinstance(item, dict):
-                        # Remove cache_control
-                        if "cache_control" in item:
-                            logger.info("Removing cache_control from content")
-                            item = {k: v for k, v in item.items() if k != "cache_control"}
-                        
-                        item_type = item.get("type", "")
-                        
-                        # REMOVE tool_result from user messages entirely
-                        if item_type == "tool_result":
-                            logger.info(f"Removing tool_result from message (tool_use_id: {item.get('tool_use_id', 'unknown')})")
-                            continue
-                        
-                        # Keep tool_use in assistant messages but also create tool_calls
-                        if item_type == "tool_use" and role == "assistant":
-                            # LiteLLM expects tool_calls format, keep tool_use too for compatibility
-                            new_content.append(item)
-                        else:
-                            new_content.append(item)
-                    else:
-                        new_content.append(item)
-                
-                # Only add message if it has content
-                if new_content:
-                    msg = dict(msg)  # Copy to avoid mutation
-                    msg["content"] = new_content
-                    fixed_messages.append(msg)
-                elif role == "assistant" and "tool_calls" in msg:
-                    # Keep assistant messages with tool_calls even if content is empty
-                    fixed_messages.append(msg)
-            else:
-                fixed_messages.append(msg)
-        
-        logger.info(f"Processed {len(messages)} messages -> {len(fixed_messages)} messages")
-        return fixed_messages
-    
     def do_GET(self):
+        """Handle GET requests (health check, models list)."""
         if self.path == '/health':
             response = json.dumps({
                 "status": "healthy",
-                "proxy": "cursor-gcp-connector",
-                "litellm_url": LITELLM_URL
+                "service": "cursor-gcp-connector",
+                "timestamp": datetime.utcnow().isoformat()
             }).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -197,11 +263,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(response)
         else:
-            # Forward GET requests
+            # Forward GET requests to LiteLLM
             try:
-                req = urllib.request.Request(f"{LITELLM_URL}{self.path}")
+                req = urllib.request.Request(f"{self.litellm_url}{self.path}")
                 for key, value in self.headers.items():
-                    if key.lower() not in ['host']:
+                    if key.lower() not in BLOCKED_HEADERS:
                         req.add_header(key, value)
                 
                 with urllib.request.urlopen(req, timeout=30) as response:
@@ -213,21 +279,83 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(response_body)
             except Exception as e:
-                logger.error(f"GET request error: {e}")
+                self.logger.error(f"GET error: {e}")
                 self.send_response(500)
                 self.end_headers()
-
+    
     def log_message(self, format, *args):
-        logger.debug(f"HTTP: {args}")
+        """Override to use our logger."""
+        if self.logger:
+            self.logger.debug(f"HTTP: {args[0]}")
 
+# =============================================================================
+# Main Entry Point
+# =============================================================================
 
 def main():
-    server = HTTPServer(('0.0.0.0', PROXY_PORT), ProxyHandler)
-    logger.info(f"Starting Cursor-GCP Connector on port {PROXY_PORT}")
-    logger.info(f"Forwarding to LiteLLM at {LITELLM_URL}")
-    server.serve_forever()
+    parser = argparse.ArgumentParser(
+        description="Cursor GCP Connector - Compatibility proxy for Vertex AI Claude"
+    )
+    parser.add_argument(
+        "--port", "-p",
+        type=int,
+        default=int(os.environ.get("PROXY_PORT", DEFAULT_PORT)),
+        help=f"Port to listen on (default: {DEFAULT_PORT})"
+    )
+    parser.add_argument(
+        "--litellm-url", "-u",
+        default=os.environ.get("LITELLM_URL", DEFAULT_LITELLM_URL),
+        help=f"LiteLLM backend URL (default: {DEFAULT_LITELLM_URL})"
+    )
+    parser.add_argument(
+        "--log-file", "-l",
+        default=os.environ.get("PROXY_LOG_FILE", DEFAULT_LOG_FILE),
+        help=f"Log file path (default: {DEFAULT_LOG_FILE})"
+    )
+    parser.add_argument(
+        "--debug", "-d",
+        action="store_true",
+        default=os.environ.get("PROXY_DEBUG", "").lower() in ("true", "1", "yes"),
+        help="Enable debug logging"
+    )
+    
+    args = parser.parse_args()
+    
+    # Setup logging
+    logger = setup_logging(args.log_file, args.debug)
+    
+    # Configure handler
+    ProxyHandler.litellm_url = args.litellm_url
+    ProxyHandler.logger = logger
+    ProxyHandler.debug = args.debug
+    
+    # Start server
+    server = HTTPServer(('0.0.0.0', args.port), ProxyHandler)
+    
+    logger.info("=" * 60)
+    logger.info("Cursor GCP Connector starting")
+    logger.info(f"  Listening on: http://0.0.0.0:{args.port}")
+    logger.info(f"  Forwarding to: {args.litellm_url}")
+    logger.info(f"  Log file: {args.log_file}")
+    logger.info(f"  Debug mode: {args.debug}")
+    logger.info("=" * 60)
+    
+    print(f"""
+╔══════════════════════════════════════════════════════════════╗
+║           Cursor GCP Connector - Running                     ║
+╠══════════════════════════════════════════════════════════════╣
+║  Proxy URL:    http://localhost:{args.port:<25}       ║
+║  LiteLLM URL:  {args.litellm_url:<43} ║
+║  Health check: http://localhost:{args.port}/health{' ' * 19}║
+╚══════════════════════════════════════════════════════════════╝
+    """)
+    
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        server.shutdown()
 
 
 if __name__ == "__main__":
     main()
-
