@@ -1,0 +1,13 @@
+# Cursor-GCP Connector Dependencies
+
+# LiteLLM with proxy support
+litellm[proxy]>=1.80.0
+
+# Google Cloud AI Platform for Vertex AI
+google-cloud-aiplatform>=1.38
+
+# gRPC dependencies (pinned for compatibility)
+grpcio>=1.62.3,<1.68.0
+grpcio-status>=1.62.3,<1.68.0
+protobuf>=5.26.1,<6.0
+
