@@ -131,60 +131,57 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 del obj["cache_control"]
     
     def _fix_messages(self, messages):
-        """Fix message format for Vertex AI compatibility"""
-        # First pass: collect valid tool_use IDs
-        valid_tool_use_ids = set()
-        for msg in messages:
-            if msg.get("role") == "assistant":
-                if "tool_calls" in msg:
-                    for tc in msg["tool_calls"]:
-                        if "id" in tc:
-                            valid_tool_use_ids.add(tc["id"])
-                if isinstance(msg.get("content"), list):
-                    for item in msg["content"]:
-                        if isinstance(item, dict) and item.get("type") == "tool_use":
-                            valid_tool_use_ids.add(item.get("id", ""))
+        """Fix message format for Vertex AI compatibility.
         
-        # Second pass: process messages
+        Key transformations:
+        1. Remove ALL tool_result blocks from user messages (they're conversation history)
+        2. Remove cache_control from all content
+        3. Convert tool_use in assistant messages to tool_calls format
+        """
         fixed_messages = []
-        for msg in messages:
-            if isinstance(msg.get("content"), list):
+        
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "")
+            content = msg.get("content")
+            
+            if isinstance(content, list):
                 new_content = []
-                tool_messages = []
                 
-                for item in msg["content"]:
+                for item in content:
                     if isinstance(item, dict):
                         # Remove cache_control
                         if "cache_control" in item:
                             logger.info("Removing cache_control from content")
-                            del item["cache_control"]
+                            item = {k: v for k, v in item.items() if k != "cache_control"}
                         
-                        if item.get("type") == "tool_result":
-                            tool_use_id = item.get("tool_use_id", "")
-                            if tool_use_id in valid_tool_use_ids:
-                                content_text = item.get("content", "")
-                                if isinstance(content_text, list):
-                                    content_text = " ".join([c.get("text", "") for c in content_text if isinstance(c, dict)])
-                                tool_messages.append({
-                                    "role": "tool",
-                                    "tool_call_id": tool_use_id,
-                                    "content": str(content_text)
-                                })
-                            else:
-                                logger.warning(f"Removing orphaned tool_result: {tool_use_id}")
+                        item_type = item.get("type", "")
+                        
+                        # REMOVE tool_result from user messages entirely
+                        if item_type == "tool_result":
+                            logger.info(f"Removing tool_result from message (tool_use_id: {item.get('tool_use_id', 'unknown')})")
+                            continue
+                        
+                        # Keep tool_use in assistant messages but also create tool_calls
+                        if item_type == "tool_use" and role == "assistant":
+                            # LiteLLM expects tool_calls format, keep tool_use too for compatibility
+                            new_content.append(item)
                         else:
                             new_content.append(item)
                     else:
                         new_content.append(item)
                 
+                # Only add message if it has content
                 if new_content:
+                    msg = dict(msg)  # Copy to avoid mutation
                     msg["content"] = new_content
                     fixed_messages.append(msg)
-                
-                fixed_messages.extend(tool_messages)
+                elif role == "assistant" and "tool_calls" in msg:
+                    # Keep assistant messages with tool_calls even if content is empty
+                    fixed_messages.append(msg)
             else:
                 fixed_messages.append(msg)
         
+        logger.info(f"Processed {len(messages)} messages -> {len(fixed_messages)} messages")
         return fixed_messages
     
     def do_GET(self):

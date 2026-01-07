@@ -61,21 +61,45 @@ chmod +x start.sh
 ./start.sh
 ```
 
-### 5. Configure Cursor
+### 5. Expose Publicly (Required)
 
-Since Cursor blocks `localhost` connections (SSRF protection), you need to expose the proxy publicly:
+Since Cursor blocks `localhost` connections (SSRF protection), you must expose the proxy via a tunnel:
 
 ```bash
 # Install cloudflared: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
 cloudflared tunnel --url localhost:4001
 ```
 
-This will give you a URL like `https://random-words.trycloudflare.com`
+This will output a URL like:
+```
+Your quick Tunnel has been created! Visit it at:
+https://random-words.trycloudflare.com
+```
 
-In Cursor Settings → Models → OpenAI API Key:
-- **Base URL**: `https://random-words.trycloudflare.com` (your cloudflared URL)
-- **API Key**: Your master key from `litellm-config.yaml`
-- **Model**: `claude-opus-4-5`
+### 6. Configure Cursor
+
+1. Open Cursor IDE
+2. Go to **Settings** (gear icon) → **Models**
+3. Scroll down to **OpenAI API Key** section
+4. Click **Add model** or configure existing:
+
+| Setting | Value |
+|---------|-------|
+| **Model Name** | `claude-opus-4-5` |
+| **Base URL** | `https://random-words.trycloudflare.com` (your cloudflared URL, **no trailing slash**) |
+| **API Key** | Your master key from `litellm-config.yaml` |
+
+5. Click **Save**
+6. Select `claude-opus-4-5` from the model dropdown in chat
+
+### 7. Test It!
+
+In Cursor chat, try:
+```
+Hello! Can you read the current directory?
+```
+
+You should see Claude respond and use tools successfully!
 
 ## Architecture
 
