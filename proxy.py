@@ -101,49 +101,192 @@ def remove_cache_control(obj):
     return obj
 
 
+def extract_tool_use_ids(message: dict) -> set:
+    """Extract all tool_use IDs from an assistant message (either format)."""
+    tool_ids = set()
+    
+    # Check Anthropic format: content array with tool_use items
+    content = message.get("content", [])
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "tool_use":
+                tool_id = item.get("id")
+                if tool_id:
+                    tool_ids.add(tool_id)
+    
+    # Check OpenAI format: tool_calls array
+    tool_calls = message.get("tool_calls", [])
+    if isinstance(tool_calls, list):
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                tool_id = tc.get("id")
+                if tool_id:
+                    tool_ids.add(tool_id)
+    
+    return tool_ids
+
+
+def convert_tool_use_to_openai(tool_use: dict) -> dict:
+    """
+    Convert Anthropic-style tool_use to OpenAI-style tool_call.
+    
+    Anthropic: {"type": "tool_use", "id": "...", "name": "...", "input": {...}}
+    OpenAI:    {"id": "...", "type": "function", "function": {"name": "...", "arguments": "..."}}
+    """
+    input_data = tool_use.get("input", {})
+    if isinstance(input_data, dict):
+        arguments = json.dumps(input_data)
+    else:
+        arguments = str(input_data)
+    
+    return {
+        "id": tool_use.get("id", ""),
+        "type": "function",
+        "function": {
+            "name": tool_use.get("name", ""),
+            "arguments": arguments
+        }
+    }
+
+
+def convert_tool_result_to_openai(tool_result: dict) -> dict:
+    """
+    Convert Anthropic-style tool_result to OpenAI-style tool message.
+    
+    Anthropic: {"type": "tool_result", "tool_use_id": "...", "content": "..."}
+    OpenAI:    {"role": "tool", "tool_call_id": "...", "content": "..."}
+    """
+    content = tool_result.get("content", "")
+    
+    # Handle nested content (can be string or list of text blocks)
+    if isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+            elif isinstance(item, str):
+                text_parts.append(item)
+        content = "\n".join(text_parts)
+    
+    return {
+        "role": "tool",
+        "tool_call_id": tool_result.get("tool_use_id", ""),
+        "content": str(content)
+    }
+
+
 def clean_messages(messages: list, logger: logging.Logger) -> list:
     """
-    Clean messages to be compatible with Vertex AI Claude.
+    Clean messages to be compatible with LiteLLM and Vertex AI Claude.
     
-    Main issue: Cursor sends conversation history with `tool_result` blocks
-    embedded in user messages, but Vertex AI requires tool_result to immediately
-    follow the assistant's tool_use message. Solution: remove tool_result blocks.
+    Key transformations:
+    1. Convert Anthropic-style tool_result to OpenAI-style role: "tool" messages
+    2. Only keep tool_result blocks that match a tool_use in the preceding assistant message
+    3. Remove orphaned tool_result blocks (historical ones without matching tool_use)
+    4. Remove cache_control from all content
+    
+    This preserves the tool calling flow while removing problematic history.
     """
     cleaned = []
+    pending_tool_ids = set()  # Tool IDs from the most recent assistant message
     
     for msg in messages:
         if not isinstance(msg, dict):
             cleaned.append(msg)
             continue
-            
+        
+        role = msg.get("role", "")
         content = msg.get("content")
         
-        if isinstance(content, list):
-            # Filter out tool_result blocks from content array
+        # If this is an assistant message, extract tool_use IDs and convert to OpenAI format
+        if role == "assistant":
+            pending_tool_ids = extract_tool_use_ids(msg)
+            
+            # Convert Anthropic-style tool_use in content to OpenAI-style tool_calls
+            if isinstance(content, list):
+                tool_calls = []
+                other_content = []
+                
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get("type") == "tool_use":
+                            tool_calls.append(convert_tool_use_to_openai(item))
+                        else:
+                            remove_cache_control(item)
+                            other_content.append(item)
+                    else:
+                        other_content.append(item)
+                
+                # If we found tool_use blocks, convert to OpenAI format
+                if tool_calls:
+                    logger.debug(f"Converting {len(tool_calls)} tool_use to OpenAI tool_calls format")
+                    msg["tool_calls"] = tool_calls
+                    # OpenAI format: content can be null or text when there are tool_calls
+                    if other_content:
+                        # Extract text content if any
+                        text_parts = [item.get("text", "") for item in other_content 
+                                     if isinstance(item, dict) and item.get("type") == "text"]
+                        msg["content"] = " ".join(text_parts) if text_parts else None
+                    else:
+                        msg["content"] = None
+                else:
+                    msg["content"] = other_content if other_content else content
+            
+            if pending_tool_ids:
+                logger.debug(f"Assistant made tool calls: {pending_tool_ids}")
+            
+            cleaned.append(msg)
+            continue
+        
+        # For user messages, handle tool_result blocks
+        if role == "user" and isinstance(content, list):
             new_content = []
+            tool_messages = []  # Collect tool results to add as separate messages
+            removed_results = 0
+            
             for item in content:
                 if isinstance(item, dict):
                     item_type = item.get("type", "")
                     
-                    # Skip tool_result blocks entirely
                     if item_type == "tool_result":
-                        logger.debug(f"Removing tool_result block: {item.get('tool_use_id', 'unknown')}")
-                        continue
-                    
-                    # Remove cache_control from item
-                    remove_cache_control(item)
-                    new_content.append(item)
+                        tool_use_id = item.get("tool_use_id", "")
+                        
+                        # Keep if it matches a pending tool_use from the previous assistant message
+                        if tool_use_id in pending_tool_ids:
+                            logger.debug(f"Converting tool_result to OpenAI format: {tool_use_id}")
+                            tool_messages.append(convert_tool_result_to_openai(item))
+                        else:
+                            # Orphaned tool_result - remove it
+                            logger.debug(f"Removing orphaned tool_result: {tool_use_id}")
+                            removed_results += 1
+                    else:
+                        # Non-tool_result content - keep it
+                        remove_cache_control(item)
+                        new_content.append(item)
                 else:
                     new_content.append(item)
             
-            # Only add message if it has content left
+            if tool_messages or removed_results > 0:
+                logger.info(f"Tool results: converted {len(tool_messages)}, removed {removed_results} orphaned")
+            
+            # Clear pending tool IDs after processing user message
+            pending_tool_ids = set()
+            
+            # Add the user message if it has non-tool content
             if new_content:
                 msg["content"] = new_content
                 cleaned.append(msg)
-            else:
-                logger.debug(f"Dropping empty message after cleaning")
+            
+            # Add converted tool messages as separate OpenAI-style messages
+            for tool_msg in tool_messages:
+                cleaned.append(tool_msg)
+                
         else:
-            # Simple string content - keep as is
+            # Simple string content or other role - keep as is
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        remove_cache_control(item)
             cleaned.append(msg)
     
     return cleaned
@@ -202,6 +345,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
             
             # Process and clean the request
             data = process_request_body(data, self.logger)
+            
+            # Log the modified messages for debugging
+            if self.debug and "messages" in data:
+                self.logger.debug(f"Modified messages being sent to LiteLLM:")
+                for i, msg in enumerate(data["messages"]):
+                    role = msg.get("role", "unknown")
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        content_preview = content[:100]
+                    else:
+                        content_preview = json.dumps(content)[:200]
+                    self.logger.debug(f"  [{i}] {role}: {content_preview}")
             
             # Forward to LiteLLM
             modified_body = json.dumps(data).encode('utf-8')
