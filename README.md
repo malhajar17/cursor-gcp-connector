@@ -1,271 +1,198 @@
 # Cursor GCP Connector
 
-> 🚀 Use Claude models from Google Cloud Vertex AI in Cursor IDE
+A CLI tool that enables Cursor IDE to use Claude models via Google Cloud Vertex AI.
 
-This project provides a compatibility layer between Cursor IDE and Claude models on Vertex AI. It handles the translation between Cursor's OpenAI-compatible API format and Vertex AI's requirements.
+## Overview
 
-## Why This Exists
+Cursor IDE sends requests in OpenAI-compatible format, but Vertex AI's Claude implementation has specific requirements that cause compatibility issues. This tool acts as a translation layer, handling the necessary request transformations automatically.
 
-Cursor IDE uses an OpenAI-compatible API format, but Claude on Vertex AI has specific requirements:
-- No `cache_control` in messages (beta feature)
-- No orphaned `tool_result` blocks in conversation history
-- No `Anthropic-Beta` headers
-- Different `tool_choice` format
+### Architecture
 
-This proxy automatically handles all these incompatibilities.
+```
+Cursor IDE --> Compatibility Proxy (port 4001) --> LiteLLM (port 4000) --> Vertex AI Claude
+```
 
----
+### What It Solves
 
-## 📋 Prerequisites
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| `invalid beta flag` | `cache_control` in message content | Stripped from requests |
+| `tool_choice.tool.name: Field required` | Malformed `tool_choice` parameter | Parameter removed |
+| `unexpected tool_use_id in tool_result` | Orphaned tool results in conversation history | Tool results cleaned |
+| `invalid content type=tool_result` | Anthropic-specific message format | Messages reformatted |
 
-| Requirement | Details |
-|-------------|---------|
-| **Google Cloud Project** | With Vertex AI API enabled |
-| **Service Account** | With "Vertex AI User" role |
-| **Claude Access** | Claude models enabled on Vertex AI |
-| **Python 3.8+** | For running the proxy |
+## Requirements
 
----
+- Python 3.8+
+- Google Cloud service account with Vertex AI access
+- LiteLLM
+- Cloudflare Tunnel (for exposing local proxy to Cursor)
 
-## 🚀 Quick Start
-
-### 1. Clone the Repository
+## Installation
 
 ```bash
 git clone https://github.com/malhajar17/cursor-gcp-connector.git
 cd cursor-gcp-connector
-```
-
-### 2. Install Dependencies
-
-```bash
 pip install -r requirements.txt
 ```
 
-### 3. Configure Google Cloud Credentials
+## Configuration
+
+### 1. Google Cloud Setup
+
+Ensure your service account has the **Vertex AI User** role:
 
 ```bash
-export GOOGLE_APPLICATION_CREDENTIALS="/path/to/your/service-account.json"
+gcloud projects add-iam-policy-binding PROJECT_ID \
+    --member="serviceAccount:SERVICE_ACCOUNT_EMAIL" \
+    --role="roles/aiplatform.user"
 ```
 
-### 4. Edit Configuration
+Set the credentials environment variable:
 
-Open `litellm-config.yaml` and update:
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
+```
+
+### 2. LiteLLM Configuration
+
+Create `config.yaml`:
 
 ```yaml
 model_list:
   - model_name: claude-opus-4-5
     litellm_params:
       model: vertex_ai/claude-opus-4-5
-      vertex_ai_project: "YOUR_PROJECT_ID"    # ← Change this
+      vertex_ai_project: "YOUR_PROJECT_ID"
       vertex_ai_location: "global"
       drop_params: true
 
 litellm_settings:
-  master_key: sk-your-secret-key-here         # ← Change this
-  drop_params: ["tool_choice"]
+  master_key: "YOUR_API_KEY"
+  drop_params: true
   modify_params: true
 ```
 
-### 5. Start the Services
+Generate a secure API key:
 
 ```bash
-./start.sh
+python3 -c "import secrets; print('sk-' + secrets.token_hex(32))"
 ```
 
-This starts:
-- **LiteLLM** on port 4000 (internal)
-- **Proxy** on port 4001 (connect here)
+## Usage
 
-### 6. Expose to Internet (for Cursor)
-
-Cursor blocks localhost connections, so you need a public URL:
+### Start the connector
 
 ```bash
-# Using Cloudflare Tunnel (free, no signup)
-cloudflared tunnel --url localhost:4001
+# Start with default configuration
+python cursor-gcp-connector --config config.yaml
+
+# Specify ports
+python cursor-gcp-connector --config config.yaml --proxy-port 4001 --litellm-port 4000
+
+# Run LiteLLM separately (proxy only mode)
+python cursor-gcp-connector --proxy-only --proxy-port 4001 --litellm-port 4000
 ```
 
-Copy the generated URL (e.g., `https://random-words.trycloudflare.com`)
+### Expose via tunnel
 
----
-
-## ⚙️ Cursor IDE Configuration
-
-### Step 1: Open Settings
-
-`Ctrl/Cmd + ,` → Search for "OpenAI"
-
-### Step 2: Configure OpenAI API
-
-| Setting | Value |
-|---------|-------|
-| **Override OpenAI Base URL** | `https://your-cloudflare-url.trycloudflare.com` |
-| **OpenAI API Key** | Your master key from `litellm-config.yaml` |
-
-### Step 3: Add the Model
-
-Go to **Settings** → **Models** → **Model Names**
-
-Add: `claude-opus-4-5`
-
-### Step 4: Select the Model
-
-In any Cursor chat, click the model dropdown and select `claude-opus-4-5`
-
----
-
-## 📁 Project Structure
-
-```
-cursor-gcp-connector/
-├── proxy.py              # Compatibility proxy (handles API translation)
-├── litellm-config.yaml   # LiteLLM configuration
-├── start.sh              # One-command startup script
-├── requirements.txt      # Python dependencies
-└── README.md             # This file
-```
-
----
-
-## 🔧 Configuration Reference
-
-### litellm-config.yaml
-
-```yaml
-model_list:
-  - model_name: claude-opus-4-5          # Name you'll use in Cursor
-    litellm_params:
-      model: vertex_ai/claude-opus-4-5   # Vertex AI model ID
-      vertex_ai_project: "your-project"  # GCP Project ID
-      vertex_ai_location: "global"       # Region (global recommended)
-      drop_params: true
-
-  # Add more models as needed:
-  - model_name: claude-sonnet-4
-    litellm_params:
-      model: vertex_ai/claude-sonnet-4-20250514
-      vertex_ai_project: "your-project"
-      vertex_ai_location: "us-east5"
-      drop_params: true
-
-litellm_settings:
-  master_key: sk-your-secret-key        # API key for authentication
-  drop_params: ["tool_choice"]
-  modify_params: true
-```
-
-### Available Models
-
-| Model Name | Vertex AI ID | Recommended Location |
-|------------|--------------|---------------------|
-| Claude Opus 4.5 | `claude-opus-4-5` | `global` |
-| Claude Sonnet 4 | `claude-sonnet-4-20250514` | `us-east5` |
-| Claude Sonnet 4.5 | `claude-sonnet-4-5-20250929` | `us-east5` |
-| Claude Haiku 4.5 | `claude-haiku-4-5-20251001` | `us-east5` |
-
----
-
-## 🔍 Troubleshooting
-
-### Check Service Status
+In a separate terminal:
 
 ```bash
-# Check if services are running
+cloudflared tunnel --url http://localhost:4001
+```
+
+Note the generated URL (e.g., `https://example-tunnel.trycloudflare.com`).
+
+### Configure Cursor IDE
+
+1. Open Cursor Settings
+2. Navigate to **Models** > **Model Names**
+3. Add `claude-opus-4-5`
+4. Under **OpenAI API Key**, configure:
+
+| Field | Value |
+|-------|-------|
+| OpenAI Base URL | Your Cloudflare tunnel URL (no trailing slash) |
+| OpenAI API Key | The master key from your config.yaml |
+
+5. Select `claude-opus-4-5` in the model dropdown
+
+## CLI Reference
+
+```
+usage: cursor-gcp-connector [-h] [--config CONFIG] [--proxy-port PORT]
+                            [--litellm-port PORT] [--proxy-only] [--verbose]
+                            [--log-file FILE]
+
+Cursor GCP Connector - Bridge Cursor IDE to Vertex AI Claude
+
+options:
+  -h, --help            show this help message and exit
+  --config CONFIG       Path to LiteLLM config file (default: config.yaml)
+  --proxy-port PORT     Port for compatibility proxy (default: 4001)
+  --litellm-port PORT   Port for LiteLLM server (default: 4000)
+  --proxy-only          Run proxy only, assumes LiteLLM is running separately
+  --verbose             Enable verbose logging
+  --log-file FILE       Log to file instead of stdout
+```
+
+## Troubleshooting
+
+### Connection refused
+
+Ensure both LiteLLM and the proxy are running:
+
+```bash
 curl http://localhost:4000/health  # LiteLLM
 curl http://localhost:4001/health  # Proxy
 ```
 
-### View Logs
+### Authentication errors
+
+Verify your service account credentials:
 
 ```bash
-# Proxy logs
-tail -f /tmp/proxy.log
-
-# Last request from Cursor (for debugging)
-cat /tmp/cursor_request.json | jq .
+gcloud auth application-default print-access-token
 ```
 
-### Common Errors
+### Model not found
 
-| Error | Cause | Solution |
-|-------|-------|----------|
-| `ssrf_blocked` | Cursor blocks localhost | Use Cloudflare Tunnel |
-| `Permission denied` | Missing IAM role | Add "Vertex AI User" role to service account |
-| `Model not found` | Wrong region/model | Check model availability in your region |
-| `invalid beta flag` | Unsupported features | Proxy should handle this - restart it |
-
-### Restart Services
+Check available models in your region:
 
 ```bash
-# Kill existing processes
-pkill -f "litellm --config"
-pkill -f "proxy.py"
-
-# Start fresh
-./start.sh
+gcloud ai models list --region=global --filter="name:claude"
 ```
 
----
+### SSRF blocked errors in Cursor
 
-## 🛡️ Security Notes
+Cursor blocks localhost connections. You must use a tunnel:
 
-1. **Never commit credentials** - Keep your service account JSON and master key private
-2. **Use strong master keys** - Generate with: `openssl rand -hex 32`
-3. **Cloudflare URLs are temporary** - They change on each restart
-
----
-
-## 📝 How It Works
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Cursor IDE                               │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ HTTPS (OpenAI format)
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Cloudflare Tunnel                             │
-│                  (public URL → localhost)                        │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ HTTP :4001
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     Compatibility Proxy                          │
-│  • Removes cache_control from messages                           │
-│  • Removes orphaned tool_result blocks                           │
-│  • Filters Anthropic-Beta headers                                │
-│  • Removes unsupported parameters                                │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ HTTP :4000
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                         LiteLLM                                  │
-│           (OpenAI → Vertex AI translation)                       │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              │ HTTPS (Vertex AI API)
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Google Cloud Vertex AI                         │
-│                      Claude Models                               │
-└─────────────────────────────────────────────────────────────────┘
+```bash
+cloudflared tunnel --url http://localhost:4001
 ```
 
----
+## Development
 
-## 📄 License
+### Running tests
 
-MIT License - feel free to use and modify.
+```bash
+# Test proxy health
+curl http://localhost:4001/health
 
----
+# Test chat completion
+curl http://localhost:4001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -d '{"model": "claude-opus-4-5", "messages": [{"role": "user", "content": "Hello"}]}'
+```
 
-## 🤝 Contributing
+### Debug mode
 
-Issues and PRs welcome! If you encounter a new Cursor/Vertex AI incompatibility, please open an issue with:
-1. The error message
-2. Contents of `/tmp/cursor_request.json`
-3. Contents of `/tmp/proxy.log`
+```bash
+python cursor-gcp-connector --config config.yaml --verbose --log-file debug.log
+```
+
+## License
+
+MIT
