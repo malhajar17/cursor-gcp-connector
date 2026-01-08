@@ -1,8 +1,4 @@
-# LiteLLM Configuration for Vertex AI Claude
-# Replace YOUR_PROJECT_ID with your Google Cloud Project ID
-
 model_list:
-  # Claude Opus 4.5 - Most capable model
   - model_name: claude-opus-4-5
     litellm_params:
       model: vertex_ai/claude-opus-4-5
@@ -10,25 +6,7 @@ model_list:
       vertex_ai_location: "global"
       drop_params: true
 
-  # Claude Sonnet 4.5 - Balanced model (if available in your region)
-  # - model_name: claude-sonnet-4-5
-  #   litellm_params:
-  #     model: vertex_ai/claude-sonnet-4-5
-  #     vertex_ai_project: "YOUR_PROJECT_ID"
-  #     vertex_ai_location: "us-east5"
-  #     drop_params: true
-
-  # Claude Haiku 4.5 - Fast model (if available in your region)
-  # - model_name: claude-haiku-4-5
-  #   litellm_params:
-  #     model: vertex_ai/claude-haiku-4-5
-  #     vertex_ai_project: "YOUR_PROJECT_ID"
-  #     vertex_ai_location: "us-east5"
-  #     drop_params: true
-
 litellm_settings:
-  # Generate a secure master key: python -c "import secrets; print('sk-' + secrets.token_hex(32))"
-  master_key: YOUR_MASTER_KEY
+  master_key: "YOUR_API_KEY"
   drop_params: true
   modify_params: true
-

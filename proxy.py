@@ -175,6 +175,41 @@ def convert_tool_result_to_openai(tool_result: dict) -> dict:
     }
 
 
+def convert_image_to_openai(item: dict) -> dict:
+    """
+    Convert Anthropic-style image to OpenAI-style image_url.
+    
+    Anthropic: {"type": "image", "source": {"type": "base64", "media_type": "...", "data": "..."}}
+    OpenAI:    {"type": "image_url", "image_url": {"url": "data:...;base64,..."}}
+    
+    Also handles URL-based images:
+    Anthropic: {"type": "image", "source": {"type": "url", "url": "..."}}
+    OpenAI:    {"type": "image_url", "image_url": {"url": "..."}}
+    """
+    source = item.get("source", {})
+    source_type = source.get("type", "")
+    
+    if source_type == "base64":
+        media_type = source.get("media_type", "image/png")
+        data = source.get("data", "")
+        url = f"data:{media_type};base64,{data}"
+        return {
+            "type": "image_url",
+            "image_url": {"url": url}
+        }
+    elif source_type == "url":
+        return {
+            "type": "image_url",
+            "image_url": {"url": source.get("url", "")}
+        }
+    else:
+        # Unknown format, try to pass through with type change
+        return {
+            "type": "image_url",
+            "image_url": {"url": item.get("url", source.get("url", ""))}
+        }
+
+
 def clean_messages(messages: list, logger: logging.Logger) -> list:
     """
     Clean messages to be compatible with LiteLLM and Vertex AI Claude.
@@ -238,11 +273,12 @@ def clean_messages(messages: list, logger: logging.Logger) -> list:
             cleaned.append(msg)
             continue
         
-        # For user messages, handle tool_result blocks
+        # For user messages, handle tool_result blocks and images
         if role == "user" and isinstance(content, list):
             new_content = []
             tool_messages = []  # Collect tool results to add as separate messages
             removed_results = 0
+            converted_images = 0
             
             for item in content:
                 if isinstance(item, dict):
@@ -259,12 +295,20 @@ def clean_messages(messages: list, logger: logging.Logger) -> list:
                             # Orphaned tool_result - remove it
                             logger.debug(f"Removing orphaned tool_result: {tool_use_id}")
                             removed_results += 1
+                    elif item_type == "image":
+                        # Convert Anthropic-style image to OpenAI-style image_url
+                        logger.debug("Converting image to OpenAI image_url format")
+                        new_content.append(convert_image_to_openai(item))
+                        converted_images += 1
                     else:
                         # Non-tool_result content - keep it
                         remove_cache_control(item)
                         new_content.append(item)
                 else:
                     new_content.append(item)
+            
+            if converted_images > 0:
+                logger.info(f"Converted {converted_images} images to OpenAI format")
             
             if tool_messages or removed_results > 0:
                 logger.info(f"Tool results: converted {len(tool_messages)}, removed {removed_results} orphaned")
